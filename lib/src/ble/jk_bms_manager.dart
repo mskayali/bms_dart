@@ -54,7 +54,69 @@ class JkBmsManager {
   StreamSubscription<Uint8List>? _notifySub;
   String? _connectedDeviceId;
   String? _foundServiceUuid;
-  String? _foundCharUuid;
+  String? _foundWriteCharUuid;
+  String? _foundNotifyCharUuid;
+
+  // ---------------------------------------------------------------------------
+  // UUID variant matching
+  // ---------------------------------------------------------------------------
+
+  /// Known JK-BMS service/characteristic UUID patterns.
+  ///
+  /// Different JK-BMS models use different UUIDs:
+  /// - Classic: FFE0 → FFE1 (single char for write+notify)
+  /// - WE24300/newer: FF00 → FF01 (notify) + FF02 (write)
+  /// - FFF0 variant: FFF0 → FFF1 (notify) + FFF2 (write)
+  static const _servicePatterns = [
+    // Pattern: serviceContains, notifyContains, writeContains
+    ('FFE0', 'FFE1', 'FFE1'), // Classic JK-BMS (same char for both)
+    ('FF00', 'FF01', 'FF02'), // WE24300 / newer models
+    ('FFF0', 'FFF1', 'FFF2'), // FFF0 variant
+  ];
+
+  /// Attempt to find a matching service/characteristic set from
+  /// the discovered services.
+  ({String service, String notifyChar, String writeChar})? _findJkService(
+    List<BleService> services,
+  ) {
+    for (final (svcPattern, notifyPattern, writePattern) in _servicePatterns) {
+      for (final service in services) {
+        final svcUuid = service.uuid.toUpperCase();
+        if (!svcUuid.contains(svcPattern)) continue;
+
+        String? notifyUuid;
+        String? writeUuid;
+
+        for (final char in service.characteristics) {
+          final charUuid = char.uuid.toUpperCase();
+          final props = char.properties;
+
+          if (charUuid.contains(notifyPattern) &&
+              props.contains(CharacteristicProperty.notify)) {
+            notifyUuid = char.uuid;
+          }
+          if (charUuid.contains(writePattern) &&
+              (props.contains(CharacteristicProperty.write) ||
+                  props.contains(CharacteristicProperty.writeWithoutResponse))) {
+            writeUuid = char.uuid;
+          }
+        }
+
+        if (notifyUuid != null && writeUuid != null) {
+          debugPrint(
+            '[JK-BMS] Matched pattern $svcPattern: '
+            'service=${service.uuid}, notify=$notifyUuid, write=$writeUuid',
+          );
+          return (
+            service: service.uuid,
+            notifyChar: notifyUuid,
+            writeChar: writeUuid,
+          );
+        }
+      }
+    }
+    return null;
+  }
 
   // ---------------------------------------------------------------------------
   // Public API — Streams
@@ -71,6 +133,13 @@ class JkBmsManager {
 
   /// Currently connected device ID, or null if disconnected.
   String? get connectedDeviceId => _connectedDeviceId;
+
+  /// Notify characteristic UUID discovered during connection.
+  /// Useful for debug display.
+  String? get connectedNotifyCharUuid => _foundNotifyCharUuid;
+
+  /// Write characteristic UUID discovered during connection.
+  String? get connectedWriteCharUuid => _foundWriteCharUuid;
 
   // ---------------------------------------------------------------------------
   // Public API — Scanning
@@ -156,41 +225,34 @@ class JkBmsManager {
       }
     }
 
-    // Find the JK-BMS service and characteristic
-    String? foundServiceUuid;
-    String? foundCharUuid;
-    for (final service in services) {
-      if (service.uuid.toUpperCase().contains('FFE0')) {
-        foundServiceUuid = service.uuid;
-        for (final char in service.characteristics) {
-          if (char.uuid.toUpperCase().contains('FFE1')) {
-            foundCharUuid = char.uuid;
-            break;
-          }
-        }
-      }
-    }
+    // Find JK-BMS service using pattern matching
+    final match = _findJkService(services);
 
-    if (foundServiceUuid == null || foundCharUuid == null) {
-      debugPrint('[JK-BMS] FFE0/FFE1 not found! Available services:');
+    if (match == null) {
+      debugPrint('[JK-BMS] No matching JK-BMS service found! Available:');
       for (final s in services) {
         debugPrint('[JK-BMS]   ${s.uuid}');
       }
       _eventController.add(BmsErrorEvent(
-        message: 'FFE1 characteristic not found on device $deviceId',
+        message: 'JK-BMS servisi bulunamadı ($deviceId)',
       ));
       throw Exception(
-        'FFE0/FFE1 characteristic bulunamadı. '
-        '${services.length} servis keşfedildi.',
+        'JK-BMS servisi bulunamadı. '
+        '${services.length} servis keşfedildi. '
+        'Desteklenen: FFE0/FFE1, FF00/FF01+FF02, FFF0/FFF1+FFF2',
       );
     }
 
-    _log('RX', 'Found FFE1 characteristic');
-    debugPrint('[JK-BMS] Found service=$foundServiceUuid char=$foundCharUuid');
+    _log('RX', 'Found JK-BMS service');
+    debugPrint(
+      '[JK-BMS] Using service=${match.service}, '
+      'notify=${match.notifyChar}, write=${match.writeChar}',
+    );
 
     // Store discovered UUIDs for write operations
-    _foundServiceUuid = foundServiceUuid;
-    _foundCharUuid = foundCharUuid;
+    _foundServiceUuid = match.service;
+    _foundWriteCharUuid = match.writeChar;
+    _foundNotifyCharUuid = match.notifyChar;
 
     // Subscribe to frame assembly
     _frameSub?.cancel();
@@ -200,20 +262,20 @@ class JkBmsManager {
     _notifySub?.cancel();
     _notifySub = UniversalBle.characteristicValueStream(
       deviceId,
-      foundCharUuid,
+      match.notifyChar,
     ).listen((value) {
       _logHex('RX', value);
       _frameAssembler.addChunk(value);
     });
 
     // Enable notifications with timeout
-    _log('TX', 'Enabling notifications...');
-    debugPrint('[JK-BMS] Enabling notifications...');
+    _log('TX', 'Enabling notifications on ${match.notifyChar}...');
+    debugPrint('[JK-BMS] Enabling notifications on ${match.notifyChar}...');
     try {
       await UniversalBle.subscribeNotifications(
         deviceId,
-        foundServiceUuid,
-        foundCharUuid,
+        match.service,
+        match.notifyChar,
       ).timeout(const Duration(seconds: 10));
     } on TimeoutException {
       debugPrint('[JK-BMS] Notification subscription timeout');
@@ -236,6 +298,9 @@ class JkBmsManager {
     _notifySub?.cancel();
     _notifySub = null;
     _frameAssembler.reset();
+    _foundServiceUuid = null;
+    _foundWriteCharUuid = null;
+    _foundNotifyCharUuid = null;
   }
 
   // ---------------------------------------------------------------------------
@@ -306,7 +371,7 @@ class JkBmsManager {
   Future<void> _writeFrame(Uint8List frame) async {
     if (_connectedDeviceId == null ||
         _foundServiceUuid == null ||
-        _foundCharUuid == null) {
+        _foundWriteCharUuid == null) {
       _eventController.add(BmsErrorEvent(
         message: 'No device connected',
       ));
@@ -314,13 +379,13 @@ class JkBmsManager {
     }
 
     _logHex('TX', frame);
-    debugPrint('[JK-BMS] TX ${frame.length} bytes to $_foundCharUuid');
+    debugPrint('[JK-BMS] TX ${frame.length} bytes to $_foundWriteCharUuid');
 
     try {
       await UniversalBle.write(
         _connectedDeviceId!,
         _foundServiceUuid!,
-        _foundCharUuid!,
+        _foundWriteCharUuid!,
         frame,
         withoutResponse: true,
       );
