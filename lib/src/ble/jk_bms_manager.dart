@@ -74,13 +74,17 @@ class JkBmsManager {
   // Public API — Scanning
   // ---------------------------------------------------------------------------
 
-  /// Start BLE scan filtered for JK-BMS service UUID.
+  /// Start BLE scan for all nearby devices.
+  ///
+  /// JK-BMS devices typically do **not** advertise the FFE0 service UUID
+  /// in their advertisement packets — the service is only discoverable
+  /// after connecting. Therefore we scan without a service filter.
+  /// Device names usually start with `JK-` or `JK_`.
+  ///
+  /// batmon-ha (`bmslib/bt.py`) also scans without service filter and
+  /// matches devices by name prefix.
   Future<void> startScan() async {
-    await UniversalBle.startScan(
-      scanFilter: ScanFilter(
-        withServices: [kJkServiceUuid],
-      ),
-    );
+    await UniversalBle.startScan();
   }
 
   /// Stop BLE scanning.
