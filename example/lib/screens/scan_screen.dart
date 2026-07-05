@@ -27,6 +27,7 @@ class _ScanScreenState extends State<ScanScreen> {
   void initState() {
     super.initState();
     _checkBleAvailability();
+    _cleanupStaleConnections();
 
     _scanSub = _manager.scanStream.listen((device) {
       // Avoid duplicates
@@ -39,6 +40,23 @@ class _ScanScreenState extends State<ScanScreen> {
         }
       });
     });
+  }
+
+  /// Disconnect any stale BLE connections left over from hot restart.
+  ///
+  /// During hot restart, the Dart state resets but the native BLE
+  /// connection persists. This method finds connected devices and
+  /// disconnects them so we start fresh.
+  Future<void> _cleanupStaleConnections() async {
+    try {
+      final connected = await UniversalBle.getSystemDevices();
+      for (final device in connected) {
+        debugPrint('[JK-BMS] Cleaning up stale connection: ${device.deviceId}');
+        await UniversalBle.disconnect(device.deviceId);
+      }
+    } catch (e) {
+      debugPrint('[JK-BMS] Stale cleanup error (safe to ignore): $e');
+    }
   }
 
   Future<void> _checkBleAvailability() async {
