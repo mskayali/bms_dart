@@ -1,0 +1,21 @@
+name: jk_bms
+description: >
+  JK-BMS BLE GATT protocol plugin for Flutter.
+  Connects to JK-BMS devices over Bluetooth Low Energy,
+  parses cell/status and device info frames.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.1.3
+  flutter: ">=3.3.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  universal_ble: ^2.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
