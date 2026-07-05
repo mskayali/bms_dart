@@ -28,5 +28,9 @@
 	<string>MainMenu</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>JK-BMS BLE test uygulaması, batarya yönetim sisteminize bağlanmak için Bluetooth kullanır.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>JK-BMS cihazına BLE üzerinden bağlanmak için Bluetooth izni gereklidir.</string>
 </dict>
 </plist>
