@@ -53,6 +53,8 @@ class JkBmsManager {
   StreamSubscription<bool>? _connectionSub;
   StreamSubscription<Uint8List>? _notifySub;
   String? _connectedDeviceId;
+  String? _foundServiceUuid;
+  String? _foundCharUuid;
 
   // ---------------------------------------------------------------------------
   // Public API — Streams
@@ -99,8 +101,8 @@ class JkBmsManager {
   /// Connect to a JK-BMS device by [deviceId].
   ///
   /// Performs the full connection sequence:
-  /// 1. BLE connect
-  /// 2. Discover services
+  /// 1. BLE connect (10s timeout)
+  /// 2. Discover services (10s timeout)
   /// 3. Find FFE0/FFE1
   /// 4. Subscribe to notifications
   Future<void> connect(String deviceId) async {
@@ -110,6 +112,7 @@ class JkBmsManager {
     _connectionSub?.cancel();
     _connectionSub = UniversalBle.connectionStream(deviceId).listen(
       (isConnected) {
+        debugPrint('[JK-BMS] Connection state: $isConnected');
         if (!isConnected) {
           _log('RX', 'Disconnected from $deviceId');
           _connectedDeviceId = null;
@@ -117,15 +120,41 @@ class JkBmsManager {
       },
     );
 
-    // Connect
+    // Connect with timeout
     _log('TX', 'Connecting to $deviceId...');
-    await UniversalBle.connect(deviceId);
+    debugPrint('[JK-BMS] Connecting to $deviceId...');
+    try {
+      await UniversalBle.connect(deviceId)
+          .timeout(const Duration(seconds: 10));
+    } on TimeoutException {
+      debugPrint('[JK-BMS] Connect timeout after 10s');
+      _connectedDeviceId = null;
+      throw Exception('Bağlantı zaman aşımına uğradı (10s)');
+    }
     _log('RX', 'Connected to $deviceId');
+    debugPrint('[JK-BMS] Connected to $deviceId');
 
-    // Discover services
+    // Discover services with timeout
     _log('TX', 'Discovering services...');
-    final services = await UniversalBle.discoverServices(deviceId);
+    debugPrint('[JK-BMS] Discovering services...');
+    late List<BleService> services;
+    try {
+      services = await UniversalBle.discoverServices(deviceId)
+          .timeout(const Duration(seconds: 10));
+    } on TimeoutException {
+      debugPrint('[JK-BMS] Service discovery timeout after 10s');
+      throw Exception('Servis keşfi zaman aşımına uğradı (10s)');
+    }
     _log('RX', 'Found ${services.length} services');
+    debugPrint('[JK-BMS] Found ${services.length} services');
+
+    // Log all discovered services for debugging
+    for (final service in services) {
+      debugPrint('[JK-BMS]   Service: ${service.uuid}');
+      for (final char in service.characteristics) {
+        debugPrint('[JK-BMS]     Char: ${char.uuid} props=${char.properties}');
+      }
+    }
 
     // Find the JK-BMS service and characteristic
     String? foundServiceUuid;
@@ -143,13 +172,25 @@ class JkBmsManager {
     }
 
     if (foundServiceUuid == null || foundCharUuid == null) {
+      debugPrint('[JK-BMS] FFE0/FFE1 not found! Available services:');
+      for (final s in services) {
+        debugPrint('[JK-BMS]   ${s.uuid}');
+      }
       _eventController.add(BmsErrorEvent(
         message: 'FFE1 characteristic not found on device $deviceId',
       ));
-      return;
+      throw Exception(
+        'FFE0/FFE1 characteristic bulunamadı. '
+        '${services.length} servis keşfedildi.',
+      );
     }
 
     _log('RX', 'Found FFE1 characteristic');
+    debugPrint('[JK-BMS] Found service=$foundServiceUuid char=$foundCharUuid');
+
+    // Store discovered UUIDs for write operations
+    _foundServiceUuid = foundServiceUuid;
+    _foundCharUuid = foundCharUuid;
 
     // Subscribe to frame assembly
     _frameSub?.cancel();
@@ -165,14 +206,21 @@ class JkBmsManager {
       _frameAssembler.addChunk(value);
     });
 
-    // Enable notifications
+    // Enable notifications with timeout
     _log('TX', 'Enabling notifications...');
-    await UniversalBle.subscribeNotifications(
-      deviceId,
-      foundServiceUuid,
-      foundCharUuid,
-    );
+    debugPrint('[JK-BMS] Enabling notifications...');
+    try {
+      await UniversalBle.subscribeNotifications(
+        deviceId,
+        foundServiceUuid,
+        foundCharUuid,
+      ).timeout(const Duration(seconds: 10));
+    } on TimeoutException {
+      debugPrint('[JK-BMS] Notification subscription timeout');
+      throw Exception('Notification aboneliği zaman aşımına uğradı');
+    }
     _log('RX', 'Notifications enabled');
+    debugPrint('[JK-BMS] Notifications enabled — ready!');
   }
 
   /// Disconnect from the currently connected device.
@@ -256,7 +304,9 @@ class JkBmsManager {
 
   /// Write a request frame to the JK-BMS characteristic.
   Future<void> _writeFrame(Uint8List frame) async {
-    if (_connectedDeviceId == null) {
+    if (_connectedDeviceId == null ||
+        _foundServiceUuid == null ||
+        _foundCharUuid == null) {
       _eventController.add(BmsErrorEvent(
         message: 'No device connected',
       ));
@@ -264,16 +314,18 @@ class JkBmsManager {
     }
 
     _logHex('TX', frame);
+    debugPrint('[JK-BMS] TX ${frame.length} bytes to $_foundCharUuid');
 
     try {
       await UniversalBle.write(
         _connectedDeviceId!,
-        kJkServiceUuid,
-        kJkCharacteristicUuid,
+        _foundServiceUuid!,
+        _foundCharUuid!,
         frame,
         withoutResponse: true,
       );
     } catch (e) {
+      debugPrint('[JK-BMS] Write failed: $e');
       _eventController.add(BmsErrorEvent(
         message: 'Write failed: $e',
         details: e,
