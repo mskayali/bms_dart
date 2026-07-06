@@ -50,3 +50,45 @@ Uint8List deviceInfoRequest() => buildJkRequest(kCommandDeviceInfo);
 
 /// Pre-built request for logbook (command `0xA1`).
 Uint8List logbookRequest() => buildJkRequest(kCommandLogbook);
+
+// ---------------------------------------------------------------------------
+// NW TLV Protocol (0x4E 0x57) — used by newer JK-BMS models like WE24300
+// ---------------------------------------------------------------------------
+
+/// Build a NW TLV "Read All Data" request frame.
+///
+/// Frame format:
+/// ```
+/// 4E 57 00 13 00 00 00 00 06 03 00 00 00 00 00 00 68 00 00 01 29
+/// │  │  │     │           │  │                    │  │        │
+/// │  │  │     │           │  └ FrameSource: BLE   │  │        └ CRC (sum of bytes)
+/// │  │  │     │           └ Command: 0x06 ReadAll │  └ Record number
+/// │  │  │     └ Terminal Number (4 bytes)          └ End: 0x68
+/// │  │  └ Length: 0x0013 (19 bytes)
+/// └──┴ Start: "NW" (0x4E 0x57)
+/// ```
+Uint8List buildNwReadAllRequest() {
+  final frame = Uint8List.fromList([
+    0x4E, 0x57, // Start frame "NW"
+    0x00, 0x13, // Length = 19
+    0x00, 0x00, 0x00, 0x00, // Terminal number
+    0x06, // Command: Read All
+    0x03, // Frame source: BLE (0x03)
+    0x00, // Transport type: Request
+    0x00, 0x00, 0x00, 0x00, 0x00, // Data (Read All = no specific ID)
+    0x68, // End identifier
+    0x00, 0x00, 0x01, 0x29, // CRC placeholder
+  ]);
+
+  // Calculate CRC: sum of all bytes from offset 0 to length-4
+  int sum = 0;
+  for (int i = 0; i < frame.length - 4; i++) {
+    sum += frame[i];
+  }
+  frame[frame.length - 4] = (sum >> 24) & 0xFF;
+  frame[frame.length - 3] = (sum >> 16) & 0xFF;
+  frame[frame.length - 2] = (sum >> 8) & 0xFF;
+  frame[frame.length - 1] = sum & 0xFF;
+
+  return frame;
+}

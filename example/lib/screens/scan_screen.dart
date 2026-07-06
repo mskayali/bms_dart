@@ -30,6 +30,9 @@ class _ScanScreenState extends State<ScanScreen> {
     _cleanupStaleConnections();
 
     _scanSub = _manager.scanStream.listen((device) {
+      // Only show devices that look like a BMS
+      if (!JkBmsManager.isBmsDevice(device)) return;
+
       // Avoid duplicates
       final idx = _devices.indexWhere((d) => d.deviceId == device.deviceId);
       setState(() {
@@ -133,7 +136,7 @@ class _ScanScreenState extends State<ScanScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text(
-          'JK-BMS Scanner',
+          'BMS Scanner',
           style: TextStyle(fontWeight: FontWeight.w600),
         ),
         actions: [
@@ -181,7 +184,7 @@ class _ScanScreenState extends State<ScanScreen> {
                         const SizedBox(height: 16),
                         Text(
                           _isScanning
-                              ? 'JK-BMS cihazları aranıyor...'
+                              ? 'BMS cihazları aranıyor...'
                               : 'Tarama başlatmak için butona basın',
                           style: const TextStyle(color: Colors.white38),
                         ),

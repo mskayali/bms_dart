@@ -5,36 +5,46 @@ import 'package:universal_ble/universal_ble.dart';
 
 import '../models/bms_event.dart';
 import '../parsers/cell_status_parser.dart';
+import '../parsers/daly_parser.dart';
 import '../parsers/device_info_parser.dart';
 import '../parsers/settings_parser.dart';
 import '../protocol/constants.dart';
+import '../protocol/daly_constants.dart';
+import '../protocol/daly_frame_assembler.dart';
+import '../protocol/daly_request_builder.dart';
 import '../protocol/frame_assembler.dart';
 import '../protocol/request_builder.dart';
 
-/// Manages BLE connectivity and data exchange with a JK-BMS device.
+/// Detected BMS protocol type.
+enum BmsProtocolType {
+  /// Not yet detected.
+  unknown,
+
+  /// JK-BMS JK02/JK04 protocol (AA 55 90 EB).
+  jk02,
+
+  /// Daly BMS UART protocol (A5 40 xx 08).
+  daly,
+}
+
+/// Manages BLE connectivity and data exchange with BMS devices.
 ///
-/// This is the primary public API for the `jk_bms` plugin. It handles:
-/// - BLE scanning with JK-BMS service filter
-/// - Connection lifecycle management
-/// - Notification subscription and frame reassembly
-/// - Request commands (cell info, device info, logbook)
-/// - Parsed data streaming via [eventStream]
+/// Supports both **JK-BMS** (JK02/JK04) and **Daly BMS** protocols.
+/// Protocol is auto-detected on connection by probing with Daly commands
+/// first (since Daly responds immediately), then JK02.
 ///
 /// ## Usage
 /// ```dart
 /// final manager = JkBmsManager();
 ///
-/// // Listen for events
 /// manager.eventStream.listen((event) {
 ///   if (event is BmsCellStatusEvent) {
 ///     print('SOC: ${event.data.soc}%');
 ///   }
 /// });
 ///
-/// // Scan → connect → request data
 /// manager.scanStream.listen((device) async {
 ///   await manager.connect(device.deviceId);
-///   await manager.requestDeviceInfo();
 ///   await manager.requestCellStatus();
 /// });
 /// manager.startScan();
@@ -42,14 +52,23 @@ import '../protocol/request_builder.dart';
 class JkBmsManager {
   JkBmsManager({this.protocol = JkProtocol.jk02_32s});
 
-  /// Protocol version to use for parsing.
+  /// JK protocol version (used only when JK02 protocol is detected).
   final JkProtocol protocol;
 
   final _eventController = StreamController<BmsEvent>.broadcast();
-  final _frameAssembler = FrameAssembler();
   final _logController = StreamController<BmsLogEntry>.broadcast();
 
-  StreamSubscription<AssembledFrame>? _frameSub;
+  // JK02 frame assembler
+  final _jkFrameAssembler = FrameAssembler();
+
+  // Daly frame assembler
+  final _dalyFrameAssembler = DalyFrameAssembler();
+
+  // Accumulated Daly data
+  DalyBmsData _dalyData = DalyBmsData();
+
+  StreamSubscription<AssembledFrame>? _jkFrameSub;
+  StreamSubscription<DalyFrame>? _dalyFrameSub;
   StreamSubscription<bool>? _connectionSub;
   StreamSubscription<Uint8List>? _notifySub;
   String? _connectedDeviceId;
@@ -57,29 +76,31 @@ class JkBmsManager {
   String? _foundWriteCharUuid;
   String? _foundNotifyCharUuid;
 
+  /// Detected protocol type for the current connection.
+  BmsProtocolType _detectedProtocol = BmsProtocolType.unknown;
+
+  /// Whether Daly device uses BLE address (0x80) or USB address (0x40).
+  /// Determined during auto-detection probe.
+  bool _dalyUseBleAddress = true;
+
   // ---------------------------------------------------------------------------
   // UUID variant matching
   // ---------------------------------------------------------------------------
 
   /// Known JK-BMS service/characteristic UUID patterns.
-  ///
-  /// Different JK-BMS models use different UUIDs:
-  /// - Classic: FFE0 → FFE1 (single char for write+notify)
-  /// - WE24300/newer: FF00 → FF01 (notify) + FF02 (write)
-  /// - FFF0 variant: FFF0 → FFF1 (notify) + FFF2 (write)
-  static const _servicePatterns = [
+  static const _jkServicePatterns = [
     // Pattern: serviceContains, notifyContains, writeContains
     ('FFE0', 'FFE1', 'FFE1'), // Classic JK-BMS (same char for both)
-    ('FF00', 'FF01', 'FF02'), // WE24300 / newer models
+    ('FF00', 'FF01', 'FF02'), // Standard newer models
     ('FFF0', 'FFF1', 'FFF2'), // FFF0 variant
   ];
 
-  /// Attempt to find a matching service/characteristic set from
-  /// the discovered services.
+  /// Attempt to find JK-BMS service/characteristic from discovered services.
   ({String service, String notifyChar, String writeChar})? _findJkService(
     List<BleService> services,
   ) {
-    for (final (svcPattern, notifyPattern, writePattern) in _servicePatterns) {
+    for (final (svcPattern, notifyPattern, writePattern)
+        in _jkServicePatterns) {
       for (final service in services) {
         final svcUuid = service.uuid.toUpperCase();
         if (!svcUuid.contains(svcPattern)) continue;
@@ -97,14 +118,15 @@ class JkBmsManager {
           }
           if (charUuid.contains(writePattern) &&
               (props.contains(CharacteristicProperty.write) ||
-                  props.contains(CharacteristicProperty.writeWithoutResponse))) {
+                  props.contains(
+                      CharacteristicProperty.writeWithoutResponse))) {
             writeUuid = char.uuid;
           }
         }
 
         if (notifyUuid != null && writeUuid != null) {
           debugPrint(
-            '[JK-BMS] Matched pattern $svcPattern: '
+            '[BMS] Matched JK pattern $svcPattern: '
             'service=${service.uuid}, notify=$notifyUuid, write=$writeUuid',
           );
           return (
@@ -113,6 +135,45 @@ class JkBmsManager {
             writeChar: writeUuid,
           );
         }
+      }
+    }
+    return null;
+  }
+
+  /// Find Daly BMS FFF0/FFF1/FFF2 service from discovered services.
+  ({String service, String notifyChar, String writeChar})? _findDalyService(
+    List<BleService> services,
+  ) {
+    for (final service in services) {
+      if (!service.uuid.toUpperCase().contains('FFF0')) continue;
+
+      String? notifyUuid;
+      String? writeUuid;
+
+      for (final char in service.characteristics) {
+        final u = char.uuid.toUpperCase();
+        if (u.contains('FFF1') &&
+            char.properties.contains(CharacteristicProperty.notify)) {
+          notifyUuid = char.uuid;
+        }
+        if (u.contains('FFF2') &&
+            (char.properties.contains(CharacteristicProperty.write) ||
+                char.properties
+                    .contains(CharacteristicProperty.writeWithoutResponse))) {
+          writeUuid = char.uuid;
+        }
+      }
+
+      if (notifyUuid != null && writeUuid != null) {
+        debugPrint(
+          '[BMS] Found Daly service: '
+          'service=${service.uuid}, notify=$notifyUuid, write=$writeUuid',
+        );
+        return (
+          service: service.uuid,
+          notifyChar: notifyUuid,
+          writeChar: writeUuid,
+        );
       }
     }
     return null;
@@ -128,14 +189,16 @@ class JkBmsManager {
   /// Stream of raw log entries for debug display.
   Stream<BmsLogEntry> get logStream => _logController.stream;
 
-  /// Stream of scan results filtered for JK-BMS devices.
+  /// Stream of scan results.
   Stream<BleDevice> get scanStream => UniversalBle.scanStream;
 
   /// Currently connected device ID, or null if disconnected.
   String? get connectedDeviceId => _connectedDeviceId;
 
+  /// Detected protocol type for the current connection.
+  BmsProtocolType get detectedProtocol => _detectedProtocol;
+
   /// Notify characteristic UUID discovered during connection.
-  /// Useful for debug display.
   String? get connectedNotifyCharUuid => _foundNotifyCharUuid;
 
   /// Write characteristic UUID discovered during connection.
@@ -145,17 +208,52 @@ class JkBmsManager {
   // Public API — Scanning
   // ---------------------------------------------------------------------------
 
+  /// Known BMS device name prefixes for scan filtering.
+  static const _bmsNamePrefixes = [
+    'JK-',
+    'JK_',
+    'Daly',
+    'DL-',
+    'WE',
+    'SP-',
+    'SH-',
+    'Smart BMS',
+    'SmartBMS',
+    'BMS',
+  ];
+
+  /// Check if a BLE device looks like a BMS based on its advertised name.
+  ///
+  /// Returns true if the device name starts with any known BMS prefix.
+  /// Devices with no name are excluded.
+  static bool isBmsDevice(BleDevice device) {
+    final name = device.name;
+    if (name == null || name.isEmpty) return false;
+    final upper = name.toUpperCase();
+    return _bmsNamePrefixes.any(
+      (prefix) => upper.startsWith(prefix.toUpperCase()),
+    );
+  }
+
   /// Start BLE scan for all nearby devices.
   ///
-  /// JK-BMS devices typically do **not** advertise the FFE0 service UUID
-  /// in their advertisement packets — the service is only discoverable
-  /// after connecting. Therefore we scan without a service filter.
-  /// Device names usually start with `JK-` or `JK_`.
-  ///
-  /// batmon-ha (`bmslib/bt.py`) also scans without service filter and
-  /// matches devices by name prefix.
+  /// Use [isBmsDevice] to filter results on the stream side,
+  /// since most BMS devices don't advertise FFF0 in their
+  /// advertisement packets.
   Future<void> startScan() async {
     await UniversalBle.startScan();
+  }
+
+  /// Start BLE scan filtered by FFF0 service UUID.
+  ///
+  /// Not all BMS devices advertise this UUID in their advertisement,
+  /// so [startScan] (unfiltered) may discover more devices.
+  Future<void> startScanWithServiceFilter() async {
+    await UniversalBle.startScan(
+      scanFilter: ScanFilter(
+        withServices: [kDalyServiceUuid],
+      ),
+    );
   }
 
   /// Stop BLE scanning.
@@ -167,21 +265,23 @@ class JkBmsManager {
   // Public API — Connection
   // ---------------------------------------------------------------------------
 
-  /// Connect to a JK-BMS device by [deviceId].
+  /// Connect to a BMS device by [deviceId].
   ///
-  /// Performs the full connection sequence:
-  /// 1. BLE connect (10s timeout)
-  /// 2. Discover services (10s timeout)
-  /// 3. Find FFE0/FFE1
-  /// 4. Subscribe to notifications
+  /// Performs full connection with auto protocol detection:
+  /// 1. BLE connect
+  /// 2. Discover services
+  /// 3. Try Daly protocol first (FFF0/FFF1/FFF2)
+  /// 4. Fall back to JK02 protocol
   Future<void> connect(String deviceId) async {
     _connectedDeviceId = deviceId;
+    _detectedProtocol = BmsProtocolType.unknown;
+    _dalyData = DalyBmsData();
 
     // Listen for connection state changes
     _connectionSub?.cancel();
     _connectionSub = UniversalBle.connectionStream(deviceId).listen(
       (isConnected) {
-        debugPrint('[JK-BMS] Connection state: $isConnected');
+        debugPrint('[BMS] Connection state: $isConnected');
         if (!isConnected) {
           _log('RX', 'Disconnected from $deviceId');
           _connectedDeviceId = null;
@@ -191,72 +291,187 @@ class JkBmsManager {
 
     // Connect with timeout
     _log('TX', 'Connecting to $deviceId...');
-    debugPrint('[JK-BMS] Connecting to $deviceId...');
+    debugPrint('[BMS] Connecting to $deviceId...');
     try {
       await UniversalBle.connect(deviceId)
           .timeout(const Duration(seconds: 10));
     } on TimeoutException {
-      debugPrint('[JK-BMS] Connect timeout after 10s');
-      _connectedDeviceId = null;
-      throw Exception('Bağlantı zaman aşımına uğradı (10s)');
+      debugPrint('[BMS] Connection timeout');
+      throw Exception('Bağlantı zaman aşımına uğradı');
     }
-    _log('RX', 'Connected to $deviceId');
-    debugPrint('[JK-BMS] Connected to $deviceId');
 
-    // Discover services with timeout
+    _log('RX', 'Connected to $deviceId');
+    debugPrint('[BMS] Connected to $deviceId');
+
+    // Discover services
     _log('TX', 'Discovering services...');
-    debugPrint('[JK-BMS] Discovering services...');
-    late List<BleService> services;
+    debugPrint('[BMS] Discovering services...');
+
+    late final List<BleService> services;
     try {
       services = await UniversalBle.discoverServices(deviceId)
           .timeout(const Duration(seconds: 10));
     } on TimeoutException {
-      debugPrint('[JK-BMS] Service discovery timeout after 10s');
-      throw Exception('Servis keşfi zaman aşımına uğradı (10s)');
+      debugPrint('[BMS] Service discovery timeout');
+      throw Exception('Servis keşfi zaman aşımına uğradı');
     }
+
     _log('RX', 'Found ${services.length} services');
-    debugPrint('[JK-BMS] Found ${services.length} services');
+    debugPrint('[BMS] Found ${services.length} services');
 
-    // Log all discovered services for debugging
+    // Log all services for debugging
     for (final service in services) {
-      debugPrint('[JK-BMS]   Service: ${service.uuid}');
+      debugPrint('[BMS]   Service: ${service.uuid}');
       for (final char in service.characteristics) {
-        debugPrint('[JK-BMS]     Char: ${char.uuid} props=${char.properties}');
+        debugPrint(
+            '[BMS]     Char: ${char.uuid} props=${char.properties}');
       }
     }
 
-    // Find JK-BMS service using pattern matching
-    final match = _findJkService(services);
-
-    if (match == null) {
-      debugPrint('[JK-BMS] No matching JK-BMS service found! Available:');
-      for (final s in services) {
-        debugPrint('[JK-BMS]   ${s.uuid}');
+    // --- Protocol Auto-Detection ---
+    // Try Daly first (FFF0/FFF1/FFF2) since our device uses it
+    final dalyMatch = _findDalyService(services);
+    if (dalyMatch != null) {
+      final success = await _tryDalyProtocol(deviceId, dalyMatch);
+      if (success) {
+        _detectedProtocol = BmsProtocolType.daly;
+        debugPrint('[BMS] ✅ Daly protocol detected!');
+        _log('RX', 'Protocol: Daly BMS');
+        return;
       }
-      _eventController.add(BmsErrorEvent(
-        message: 'JK-BMS servisi bulunamadı ($deviceId)',
-      ));
-      throw Exception(
-        'JK-BMS servisi bulunamadı. '
-        '${services.length} servis keşfedildi. '
-        'Desteklenen: FFE0/FFE1, FF00/FF01+FF02, FFF0/FFF1+FFF2',
-      );
     }
 
-    _log('RX', 'Found JK-BMS service');
-    debugPrint(
-      '[JK-BMS] Using service=${match.service}, '
-      'notify=${match.notifyChar}, write=${match.writeChar}',
-    );
+    // Try JK02 protocol
+    final jkMatch = _findJkService(services);
+    if (jkMatch != null) {
+      await _setupJkProtocol(deviceId, jkMatch, services);
+      _detectedProtocol = BmsProtocolType.jk02;
+      debugPrint('[BMS] ✅ JK02 protocol selected');
+      _log('RX', 'Protocol: JK02');
+      return;
+    }
 
-    // Store discovered UUIDs for write operations
+    // No matching service found
+    debugPrint('[BMS] ❌ No supported BMS service found');
+    _eventController.add(BmsErrorEvent(
+      message: 'Desteklenen BMS servisi bulunamadı',
+    ));
+  }
+
+  /// Try Daly protocol: subscribe to FFF1, send 0x90, wait for response.
+  Future<bool> _tryDalyProtocol(
+    String deviceId,
+    ({String service, String notifyChar, String writeChar}) match,
+  ) async {
+    debugPrint('[BMS] Trying Daly protocol on ${match.service}...');
+
+    // Subscribe to Daly frame assembler
+    _dalyFrameSub?.cancel();
+    _dalyFrameSub = _dalyFrameAssembler.frameStream.listen(_onDalyFrame);
+
+    // Enable notifications on FFF1
+    try {
+      await UniversalBle.subscribeNotifications(
+        deviceId,
+        match.service,
+        match.notifyChar,
+      ).timeout(const Duration(seconds: 5));
+      debugPrint('[BMS] Daly FFF1 notifications enabled');
+    } catch (e) {
+      debugPrint('[BMS] Daly notification subscribe failed: $e');
+      return false;
+    }
+
+    // Store UUIDs
     _foundServiceUuid = match.service;
     _foundWriteCharUuid = match.writeChar;
     _foundNotifyCharUuid = match.notifyChar;
 
-    // Subscribe to frame assembly
-    _frameSub?.cancel();
-    _frameSub = _frameAssembler.frameStream.listen(_onFrameAssembled);
+    // Send Daly SOC probe — try BLE address (0x80) first, then USB (0x40)
+    for (final useBle in [true, false]) {
+      final addrStr = useBle ? '0x80 (BLE)' : '0x40 (USB)';
+      debugPrint('[BMS] Sending Daly SOC probe with address $addrStr...');
+
+      // Fresh completer for each attempt
+      final probeCompleter = Completer<bool>();
+
+      // Re-subscribe to capture response for this attempt
+      _notifySub?.cancel();
+      _notifySub = UniversalBle.characteristicValueStream(
+        deviceId,
+        match.notifyChar,
+      ).listen((value) {
+        debugPrint('[BMS] Daly RX: ${value.length} bytes');
+        _logHex('RX', value);
+        _dalyFrameAssembler.addChunk(value);
+        if (!probeCompleter.isCompleted) {
+          probeCompleter.complete(true);
+        }
+      });
+
+      final probeFrame = buildDalyRequest(kDalyCmdSoc, useBle: useBle);
+      try {
+        await UniversalBle.write(
+          deviceId,
+          match.service,
+          match.writeChar,
+          probeFrame,
+          withoutResponse: false,
+        );
+        debugPrint('[BMS] Daly probe $addrStr sent OK');
+      } catch (e) {
+        debugPrint('[BMS] Daly probe $addrStr write failed: $e');
+        try {
+          await UniversalBle.write(
+            deviceId,
+            match.service,
+            match.writeChar,
+            probeFrame,
+            withoutResponse: true,
+          );
+        } catch (e2) {
+          debugPrint('[BMS] Daly probe $addrStr also failed: $e2');
+          continue;
+        }
+      }
+
+      // Wait up to 2 seconds for a response
+      try {
+        final gotResponse = await probeCompleter.future
+            .timeout(const Duration(seconds: 2));
+        if (gotResponse) {
+          _dalyUseBleAddress = useBle;
+          debugPrint('[BMS] Daly responded to $addrStr ✅');
+          return true;
+        }
+      } on TimeoutException {
+        debugPrint('[BMS] Daly probe $addrStr: no response');
+        continue;
+      }
+    }
+
+    // Neither address worked
+    _notifySub?.cancel();
+    return false;
+  }
+  /// Set up JK02 protocol (legacy path).
+  Future<void> _setupJkProtocol(
+    String deviceId,
+    ({String service, String notifyChar, String writeChar}) match,
+    List<BleService> services,
+  ) async {
+    debugPrint(
+      '[BMS] Using JK service=${match.service}, '
+      'notify=${match.notifyChar}, write=${match.writeChar}',
+    );
+
+    _foundServiceUuid = match.service;
+    _foundWriteCharUuid = match.writeChar;
+    _foundNotifyCharUuid = match.notifyChar;
+
+    // Subscribe to JK frame assembly
+    _jkFrameSub?.cancel();
+    _jkFrameSub = _jkFrameAssembler.frameStream.listen(_onJkFrameAssembled);
 
     // Listen for characteristic value notifications
     _notifySub?.cancel();
@@ -265,12 +480,11 @@ class JkBmsManager {
       match.notifyChar,
     ).listen((value) {
       _logHex('RX', value);
-      _frameAssembler.addChunk(value);
+      _jkFrameAssembler.addChunk(value);
     });
 
-    // Enable notifications with timeout
+    // Enable notifications
     _log('TX', 'Enabling notifications on ${match.notifyChar}...');
-    debugPrint('[JK-BMS] Enabling notifications on ${match.notifyChar}...');
     try {
       await UniversalBle.subscribeNotifications(
         deviceId,
@@ -278,26 +492,24 @@ class JkBmsManager {
         match.notifyChar,
       ).timeout(const Duration(seconds: 10));
     } on TimeoutException {
-      debugPrint('[JK-BMS] Notification subscription timeout');
       throw Exception('Notification aboneliği zaman aşımına uğradı');
     }
     _log('RX', 'Notifications enabled');
-    debugPrint('[JK-BMS] Notifications enabled — ready!');
   }
 
   /// Disconnect from the currently connected device.
   Future<void> disconnect() async {
     if (_connectedDeviceId != null) {
-      await UniversalBle.disconnect(_connectedDeviceId!);
+      try {
+        await UniversalBle.disconnect(_connectedDeviceId!);
+      } catch (_) {}
     }
     _connectedDeviceId = null;
-    _frameSub?.cancel();
-    _frameSub = null;
-    _connectionSub?.cancel();
-    _connectionSub = null;
+    _detectedProtocol = BmsProtocolType.unknown;
     _notifySub?.cancel();
     _notifySub = null;
-    _frameAssembler.reset();
+    _jkFrameAssembler.reset();
+    _dalyFrameAssembler.reset();
     _foundServiceUuid = null;
     _foundWriteCharUuid = null;
     _foundNotifyCharUuid = null;
@@ -307,39 +519,55 @@ class JkBmsManager {
   // Public API — Commands
   // ---------------------------------------------------------------------------
 
-  /// Request cell/status data (command `0x96`).
-  Future<void> requestCellStatus() async {
-    final frame = cellInfoRequest();
-    await _writeFrame(frame);
-  }
-
-  /// Request device info (command `0x97`).
-  Future<void> requestDeviceInfo() async {
-    final frame = deviceInfoRequest();
-    await _writeFrame(frame);
-  }
-
-  /// Request logbook data (command `0xA1`).
-  Future<void> requestLogbook() async {
-    final frame = logbookRequest();
-    await _writeFrame(frame);
-  }
-
-  /// Request settings data (command `0x01`, via cell-info-like read).
+  /// Request cell/status data.
   ///
-  /// batmon-ha sends `_jk_command(0x96)` for status and also receives
-  /// settings on initial connect. Settings frames arrive as frame type `0x01`.
-  /// Some firmwares automatically send settings after connect;
-  /// otherwise, this method triggers a manual request.
-  Future<void> requestSettings() async {
-    // Settings are typically sent by BMS on connect, but can also be
-    // explicitly requested. The command for settings read varies by
-    // firmware; 0x96 triggers both status and settings on some models.
-    final frame = buildJkRequest(kFrameTypeSettings);
-    await _writeFrame(frame);
+  /// - **Daly**: Sends 0x90 (SOC), 0x91 (min/max V), 0x95 (cell voltages)
+  /// - **JK02**: Sends command 0x96
+  Future<void> requestCellStatus() async {
+    if (_detectedProtocol == BmsProtocolType.daly) {
+      final ble = _dalyUseBleAddress;
+      await _writeDalyCommand(buildDalyRequest(kDalyCmdSoc, useBle: ble));
+      await Future.delayed(const Duration(milliseconds: 200));
+      await _writeDalyCommand(buildDalyRequest(kDalyCmdMinMaxVoltage, useBle: ble));
+      await Future.delayed(const Duration(milliseconds: 200));
+      await _writeDalyCommand(buildDalyRequest(kDalyCmdMinMaxTemp, useBle: ble));
+      await Future.delayed(const Duration(milliseconds: 200));
+      await _writeDalyCommand(buildDalyRequest(kDalyCmdCellVoltages, useBle: ble));
+      await Future.delayed(const Duration(milliseconds: 200));
+      await _writeDalyCommand(buildDalyRequest(kDalyCmdMosStatus, useBle: ble));
+    } else {
+      await _writeFrame(cellInfoRequest());
+    }
   }
 
-  /// Send a custom request frame.
+  /// Request device info.
+  ///
+  /// - **Daly**: Sends 0x94 (status info with cell count)
+  /// - **JK02**: Sends command 0x97
+  Future<void> requestDeviceInfo() async {
+    if (_detectedProtocol == BmsProtocolType.daly) {
+      await _writeDalyCommand(buildDalyRequest(kDalyCmdStatusInfo, useBle: _dalyUseBleAddress));
+    } else {
+      await _writeFrame(deviceInfoRequest());
+    }
+  }
+
+  /// Request logbook data (JK02 only).
+  Future<void> requestLogbook() async {
+    if (_detectedProtocol != BmsProtocolType.daly) {
+      await _writeFrame(logbookRequest());
+    }
+  }
+
+  /// Request settings data (JK02 only).
+  Future<void> requestSettings() async {
+    if (_detectedProtocol != BmsProtocolType.daly) {
+      final frame = buildJkRequest(kFrameTypeSettings);
+      await _writeFrame(frame);
+    }
+  }
+
+  /// Send a custom request frame (JK02 only).
   Future<void> sendCustomRequest(
     int command, {
     int value = 0,
@@ -355,19 +583,55 @@ class JkBmsManager {
 
   /// Release all resources.
   void dispose() {
-    _frameSub?.cancel();
+    _jkFrameSub?.cancel();
+    _dalyFrameSub?.cancel();
     _connectionSub?.cancel();
     _notifySub?.cancel();
-    _frameAssembler.dispose();
+    _jkFrameAssembler.dispose();
+    _dalyFrameAssembler.dispose();
     _eventController.close();
     _logController.close();
   }
 
   // ---------------------------------------------------------------------------
-  // Internal
+  // Internal — Write
   // ---------------------------------------------------------------------------
 
-  /// Write a request frame to the JK-BMS characteristic.
+  /// Write a Daly command frame.
+  Future<void> _writeDalyCommand(Uint8List frame) async {
+    if (_connectedDeviceId == null ||
+        _foundServiceUuid == null ||
+        _foundWriteCharUuid == null) {
+      return;
+    }
+
+    _logHex('TX', frame);
+    debugPrint('[BMS] TX ${frame.length} bytes to $_foundWriteCharUuid');
+
+    try {
+      await UniversalBle.write(
+        _connectedDeviceId!,
+        _foundServiceUuid!,
+        _foundWriteCharUuid!,
+        frame,
+        withoutResponse: false,
+      );
+    } catch (e) {
+      try {
+        await UniversalBle.write(
+          _connectedDeviceId!,
+          _foundServiceUuid!,
+          _foundWriteCharUuid!,
+          frame,
+          withoutResponse: true,
+        );
+      } catch (e2) {
+        debugPrint('[BMS] Daly write failed: $e2');
+      }
+    }
+  }
+
+  /// Write a JK02 request frame.
   Future<void> _writeFrame(Uint8List frame) async {
     if (_connectedDeviceId == null ||
         _foundServiceUuid == null ||
@@ -379,7 +643,7 @@ class JkBmsManager {
     }
 
     _logHex('TX', frame);
-    debugPrint('[JK-BMS] TX ${frame.length} bytes to $_foundWriteCharUuid');
+    debugPrint('[BMS] TX ${frame.length} bytes to $_foundWriteCharUuid');
 
     try {
       await UniversalBle.write(
@@ -387,25 +651,85 @@ class JkBmsManager {
         _foundServiceUuid!,
         _foundWriteCharUuid!,
         frame,
-        withoutResponse: true,
+        withoutResponse: false,
       );
     } catch (e) {
-      debugPrint('[JK-BMS] Write failed: $e');
+      debugPrint('[BMS] Write with response failed, trying without: $e');
+      try {
+        await UniversalBle.write(
+          _connectedDeviceId!,
+          _foundServiceUuid!,
+          _foundWriteCharUuid!,
+          frame,
+          withoutResponse: true,
+        );
+      } catch (e2) {
+        debugPrint('[BMS] Write also failed: $e2');
+        _eventController.add(BmsErrorEvent(
+          message: 'Write failed: $e2',
+          details: e2,
+        ));
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Internal — Daly Frame Handler
+  // ---------------------------------------------------------------------------
+
+  /// Handle a fully assembled Daly frame.
+  void _onDalyFrame(DalyFrame frame) {
+    final cmdHex = '0x${frame.command.toRadixString(16).padLeft(2, '0')}';
+
+    if (!frame.checksumValid) {
+      debugPrint('[BMS] Daly frame checksum invalid for cmd $cmdHex');
       _eventController.add(BmsErrorEvent(
-        message: 'Write failed: $e',
-        details: e,
+        message: 'Daly checksum hatası: $cmdHex',
+      ));
+      return;
+    }
+
+    _log(
+      'RX',
+      'Daly frame: cmd=$cmdHex, CRC=OK',
+    );
+
+    // Parse into accumulated data
+    parseDalyFrame(frame, _dalyData);
+
+    // Emit cell status after each SOC response (primary update)
+    if (frame.command == kDalyCmdSoc) {
+      _eventController.add(BmsCellStatusEvent(
+        data: _dalyData.toCellStatus(),
+      ));
+    }
+
+    // Emit device info after status info response
+    if (frame.command == kDalyCmdStatusInfo) {
+      _eventController.add(BmsDeviceInfoEvent(
+        data: _dalyData.toDeviceInfo(),
+      ));
+    }
+
+    // Also emit updated cell status after cell voltages
+    if (frame.command == kDalyCmdCellVoltages) {
+      _eventController.add(BmsCellStatusEvent(
+        data: _dalyData.toCellStatus(),
       ));
     }
   }
 
-  /// Handle a fully assembled frame from the [FrameAssembler].
-  void _onFrameAssembled(AssembledFrame frame) {
+  // ---------------------------------------------------------------------------
+  // Internal — JK02 Frame Handler
+  // ---------------------------------------------------------------------------
+
+  /// Handle a fully assembled JK02 frame.
+  void _onJkFrameAssembled(AssembledFrame frame) {
     if (!frame.crcValid) {
       _eventController.add(BmsErrorEvent(
         message:
             'CRC mismatch for frame type 0x${frame.frameType.toRadixString(16)}',
       ));
-      // Still emit raw frame for debugging
       _eventController.add(BmsRawFrameEvent(
         frameType: frame.frameType,
         raw: frame.data,
@@ -462,8 +786,12 @@ class JkBmsManager {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Internal — Logging
+  // ---------------------------------------------------------------------------
+
   void _log(String direction, String message) {
-    debugPrint('[JkBMS][$direction] $message');
+    debugPrint('[BMS][$direction] $message');
     _logController.add(BmsLogEntry(
       timestamp: DateTime.now(),
       direction: direction,
