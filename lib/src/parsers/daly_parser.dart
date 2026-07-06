@@ -1,5 +1,7 @@
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
+
 import '../models/cell_status.dart';
 import '../models/device_info.dart';
 import '../protocol/daly_constants.dart';
@@ -43,7 +45,14 @@ class DalyBmsData {
   /// Discharging MOS state.
   bool dischargingEnabled = false;
 
-  /// Cycle count.
+  /// BMS status mode: 0=stationary, 1=charging, 2=discharging.
+  int statusMode = 0;
+
+  /// BMS life counter (heartbeat, 0-255, from 0x93 byte 3).
+  /// This is NOT the battery cycle count.
+  int bmsLife = 0;
+
+  /// Cycle count (actual battery charge/discharge cycles).
   int cycleCount = 0;
 
   /// Remaining capacity in Ah.
@@ -63,6 +72,28 @@ class DalyBmsData {
 
   /// Error/failure bitmask.
   int errors = 0;
+
+  /// Whether at least one MOS status response has been received.
+  bool mosStatusReceived = false;
+
+  /// Whether at least one SOC response has been received.
+  bool socReceived = false;
+
+  /// Battery code / model string (from 0x57 multi-frame ASCII).
+  String batteryCode = '';
+
+  /// Production / manufacturing date string (from 0x53).
+  String productionDate = '';
+
+  /// Rated (nominal/full) capacity in Ah (from 0x50).
+  double ratedCapacity = 0;
+
+  /// Rated (nominal) voltage in V (from 0x50).
+  double ratedVoltage = 0;
+
+  /// Accumulated 0x57 battery code frame fragments.
+  /// Key=frame number, Value=ASCII bytes.
+  final Map<int, String> _batteryCodeFrames = {};
 
   /// Convert accumulated data to a [JkCellStatus] model.
   JkCellStatus toCellStatus() {
@@ -91,7 +122,7 @@ class DalyBmsData {
       balancerAction: 0,
       soc: soc.round(),
       capacityRemaining: capacityRemaining,
-      fullCapacity: 0, // Not available in basic Daly responses
+      fullCapacity: ratedCapacity,
       cycleCount: cycleCount,
       totalCycleCapacity: 0,
       soh: 100,
@@ -104,15 +135,15 @@ class DalyBmsData {
     );
   }
 
-  /// Create a basic [JkDeviceInfo] from Daly data.
+  /// Create a [JkDeviceInfo] from accumulated Daly data.
   JkDeviceInfo toDeviceInfo() {
     return JkDeviceInfo(
       rawData: const [],
-      deviceName: 'Daly BMS ${cellCount}S',
-      hardwareVersion: '-',
+      deviceName: 'Daly BMS ${cellCount > 0 ? '${cellCount}S' : ''}',
+      hardwareVersion: batteryCode.isNotEmpty ? batteryCode : '-',
       softwareVersion: '-',
       serialNumber: '-',
-      manufacturingDate: '-',
+      manufacturingDate: productionDate.isNotEmpty ? productionDate : '-',
     );
   }
 }
@@ -128,6 +159,7 @@ void parseDalySoc(DalyFrame frame, DalyBmsData data) {
   data.current = (rawCurrent - kDalyCurrentOffset) * kDalyCurrentScale;
   // Bytes 6-7: SOC (×0.1%)
   data.soc = _u16(d, 6) * kDalySocScale;
+  data.socReceived = true;
 }
 
 /// Parse a Daly 0x91 (Min/Max Cell Voltage) response.
@@ -155,33 +187,47 @@ void parseDalyMinMaxTemp(DalyFrame frame, DalyBmsData data) {
 
 /// Parse a Daly 0x93 (MOS Status) response.
 ///
-/// Data layout (from batmon-ha, struct format `>b??Bl`):
+/// Python struct format: `>b??BL` (big-endian)
+/// Data layout (8 bytes):
 /// - Byte 0: Mode (0=stationary, 1=charging, 2=discharging)
-/// - Byte 1: Charge MOS (bool)
-/// - Byte 2: Discharge MOS (bool)
-/// - Byte 3: BMS life (cycles)
-/// - Bytes 4-7: Remaining capacity (×0.001 Ah)
+/// - Byte 1: Charge MOS (bool, 1=on)
+/// - Byte 2: Discharge MOS (bool, 1=on)
+/// - Byte 3: BMS life (heartbeat counter, 0-255, NOT cycle count!)
+/// - Bytes 4-7: Remaining capacity (unsigned 32-bit BE, ×0.001 Ah)
 void parseDalyMosStatus(DalyFrame frame, DalyBmsData data) {
   final d = frame.data;
-  // Byte 0: Mode
-  // Byte 1: Charge MOS state (1=on)
+  // Byte 0: Mode (0=stationary, 1=charging, 2=discharging)
+  data.statusMode = d[0];
+  // Byte 1: Charge MOS state (1=on, 0=off)
   data.chargingEnabled = d[1] != 0;
-  // Byte 2: Discharge MOS state (1=on)
+  // Byte 2: Discharge MOS state (1=on, 0=off)
   data.dischargingEnabled = d[2] != 0;
-  // Byte 3: BMS life (cycle count)
-  data.cycleCount = d[3];
+  // Byte 3: BMS life (heartbeat, NOT battery cycle count)
+  data.bmsLife = d[3];
   // Bytes 4-7: Remaining capacity (unsigned 32-bit BE, ×0.001 Ah)
   final rawCapacity = (d[4] << 24) | (d[5] << 16) | (d[6] << 8) | d[7];
   data.capacityRemaining = rawCapacity * 0.001;
+  data.mosStatusReceived = true;
 }
 
 /// Parse a Daly 0x94 (Status Info) response.
+///
+/// Verified from raw data:
+/// - Byte 0: Number of cell strings (8)
+/// - Byte 1: Number of NTC sensors (2)
+/// - Byte 2: Charger status
+/// - Byte 3: Load status
+/// - Byte 4-5: Reserved/DIO
+/// - Byte 6: Cycle count (SINGLE BYTE, 0-255)
+/// - Byte 7: Unknown (0x4A observed)
 void parseDalyStatusInfo(DalyFrame frame, DalyBmsData data) {
   final d = frame.data;
   // Byte 0: Number of cells
   data.cellCount = d[0];
   // Byte 1: Number of NTC sensors
   data.ntcCount = d[1];
+  // Byte 6: Cycle count (single byte, verified from raw data)
+  data.cycleCount = d[6];
 }
 
 /// Parse a Daly 0x95 (Cell Voltages) response.
@@ -242,25 +288,119 @@ void parseDalyFailure(DalyFrame frame, DalyBmsData data) {
   }
 }
 
+/// Parse a Daly 0x50 (Rated Parameters) response.
+///
+/// Verified from raw data: [00 04 93 e0 00 00 0c 80]
+/// - Bytes 0-3: Rated capacity (u32 BE, ×0.001 Ah) → 300000 = 300.0 Ah
+/// - Bytes 4-7: Rated voltage (u32 BE, ×0.01 V) → 3200 = 32.0 V
+void parseDalyRatedParams(DalyFrame frame, DalyBmsData data) {
+  final d = frame.data;
+  final rawCapacity = (d[0] << 24) | (d[1] << 16) | (d[2] << 8) | d[3];
+  data.ratedCapacity = rawCapacity * 0.001;
+  final rawVoltage = (d[4] << 24) | (d[5] << 16) | (d[6] << 8) | d[7];
+  data.ratedVoltage = rawVoltage * 0.01;
+}
+
+/// Parse a Daly 0x53 (Battery Details) response.
+///
+/// Verified from raw data: [00 00 19 08 07 ff ff 0a]
+/// - Bytes 0-1: Reserved
+/// - Byte 2: Production year (0x19 = 25 → 2025)
+/// - Byte 3: Production month (0x08 = August)
+/// - Byte 4: Production day (0x07 = 7th)
+/// - Bytes 5-7: Reserved/padding
+void parseDalyBatteryDetails(DalyFrame frame, DalyBmsData data) {
+  final d = frame.data;
+  final year = 2000 + d[2];
+  final month = d[3];
+  final day = d[4];
+  if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+    data.productionDate =
+        '$year-${month.toString().padLeft(2, '0')}-${day.toString().padLeft(2, '0')}';
+  }
+}
+
+/// Parse a Daly 0x57 (Battery Code) response.
+///
+/// Multi-frame ASCII: byte 0 = frame number (1-5), bytes 1-7 = ASCII chars.
+/// Verified from raw data:
+/// - Frame 1: [01 52 32 34 54 4d 31 41] → "R24TM1A"
+/// - Frame 2: [02 2d 32 34 53 32 30 30] → "-24S200"
+/// - Frame 3: [03 41 00 00 00 00 00 00] → "A"
+/// → Full string: "R24TM1A-24S200A"
+void parseDalyBatteryCode(DalyFrame frame, DalyBmsData data) {
+  final d = frame.data;
+  final frameNum = d[0];
+
+  // Extract ASCII chars (bytes 1-7), stop at null terminator
+  final buf = StringBuffer();
+  for (int i = 1; i < 8; i++) {
+    if (d[i] == 0) break;
+    buf.writeCharCode(d[i]);
+  }
+
+  data._batteryCodeFrames[frameNum] = buf.toString();
+
+  // Rebuild full battery code from all received frames, in order
+  final sorted = data._batteryCodeFrames.keys.toList()..sort();
+  final full = StringBuffer();
+  for (final key in sorted) {
+    full.write(data._batteryCodeFrames[key]);
+  }
+  data.batteryCode = full.toString();
+}
+
 /// Dispatch a Daly frame to the appropriate parser.
 void parseDalyFrame(DalyFrame frame, DalyBmsData data) {
+  final d = frame.data;
+  final hex = d.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+  final cmdHex = '0x${frame.command.toRadixString(16).padLeft(2, '0')}';
+
   switch (frame.command) {
     case kDalyCmdSoc:
       parseDalySoc(frame, data);
+      debugPrint('[DALY] $cmdHex RAW=[$hex] → V=${data.totalVoltage}, '
+          'I=${data.current}, SOC=${data.soc}');
     case kDalyCmdMinMaxVoltage:
       parseDalyMinMaxVoltage(frame, data);
+      debugPrint('[DALY] $cmdHex RAW=[$hex] → maxV=${data.maxCellVoltage}, '
+          'minV=${data.minCellVoltage}');
     case kDalyCmdMinMaxTemp:
       parseDalyMinMaxTemp(frame, data);
+      debugPrint('[DALY] $cmdHex RAW=[$hex] → maxT=${data.maxTemperature}, '
+          'minT=${data.minTemperature}');
     case kDalyCmdMosStatus:
       parseDalyMosStatus(frame, data);
+      debugPrint('[DALY] $cmdHex RAW=[$hex] → mode=${data.statusMode}, '
+          'chg=${data.chargingEnabled}, dischg=${data.dischargingEnabled}, '
+          'bmsLife=${data.bmsLife}, capRemain=${data.capacityRemaining}Ah');
     case kDalyCmdStatusInfo:
       parseDalyStatusInfo(frame, data);
+      debugPrint('[DALY] $cmdHex RAW=[$hex] → cells=${data.cellCount}, '
+          'ntc=${data.ntcCount}, cycleCount=${data.cycleCount}');
     case kDalyCmdCellVoltages:
       parseDalyCellVoltages(frame, data);
+      debugPrint('[DALY] $cmdHex RAW=[$hex] → '
+          '${data.cellVoltages.length} cells');
     case kDalyCmdCellTemps:
       parseDalyCellTemps(frame, data);
+      debugPrint('[DALY] $cmdHex RAW=[$hex] → '
+          '${data.temperatures.length} temps');
     case kDalyCmdFailure:
       parseDalyFailure(frame, data);
+      debugPrint('[DALY] $cmdHex RAW=[$hex] → errors=${data.errors}');
+    case kDalyCmdRatedParams:
+      parseDalyRatedParams(frame, data);
+      debugPrint('[DALY] $cmdHex RAW=[$hex] → ratedCap=${data.ratedCapacity}Ah, '
+          'ratedV=${data.ratedVoltage}V');
+    case kDalyCmdBatteryDetails:
+      parseDalyBatteryDetails(frame, data);
+      debugPrint('[DALY] $cmdHex RAW=[$hex] → date=${data.productionDate}');
+    case kDalyCmdBatteryCode:
+      parseDalyBatteryCode(frame, data);
+      debugPrint('[DALY] $cmdHex RAW=[$hex] → code="${data.batteryCode}"');
+    default:
+      debugPrint('[DALY] $cmdHex RAW=[$hex] (unhandled)');
   }
 }
 

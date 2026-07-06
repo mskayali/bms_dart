@@ -521,20 +521,33 @@ class JkBmsManager {
 
   /// Request cell/status data.
   ///
-  /// - **Daly**: Sends 0x90 (SOC), 0x91 (min/max V), 0x95 (cell voltages)
+  /// - **Daly**: Sends 0x93 (MOS), 0x92 (temps), 0x91 (min/max V),
+  ///            0x95 (cell voltages), 0x96 (cell temps), 0x90 (SOC — last,
+  ///            triggers final consolidated event)
   /// - **JK02**: Sends command 0x96
   Future<void> requestCellStatus() async {
     if (_detectedProtocol == BmsProtocolType.daly) {
       final ble = _dalyUseBleAddress;
-      await _writeDalyCommand(buildDalyRequest(kDalyCmdSoc, useBle: ble));
+      // Send MOS status FIRST so MOSFET states and capacity are
+      // accumulated before the final event emission.
+      await _writeDalyCommand(buildDalyRequest(kDalyCmdMosStatus, useBle: ble));
       await Future.delayed(const Duration(milliseconds: 200));
-      await _writeDalyCommand(buildDalyRequest(kDalyCmdMinMaxVoltage, useBle: ble));
+      // Status info includes cycle count (bytes 6-7)
+      await _writeDalyCommand(buildDalyRequest(kDalyCmdStatusInfo, useBle: ble));
       await Future.delayed(const Duration(milliseconds: 200));
       await _writeDalyCommand(buildDalyRequest(kDalyCmdMinMaxTemp, useBle: ble));
       await Future.delayed(const Duration(milliseconds: 200));
+      await _writeDalyCommand(buildDalyRequest(kDalyCmdMinMaxVoltage, useBle: ble));
+      await Future.delayed(const Duration(milliseconds: 200));
       await _writeDalyCommand(buildDalyRequest(kDalyCmdCellVoltages, useBle: ble));
       await Future.delayed(const Duration(milliseconds: 200));
-      await _writeDalyCommand(buildDalyRequest(kDalyCmdMosStatus, useBle: ble));
+      await _writeDalyCommand(buildDalyRequest(kDalyCmdCellTemps, useBle: ble));
+      await Future.delayed(const Duration(milliseconds: 200));
+      await _writeDalyCommand(buildDalyRequest(kDalyCmdFailure, useBle: ble));
+      await Future.delayed(const Duration(milliseconds: 200));
+      // SOC last — this triggers the primary cell status event with all
+      // accumulated data from the previous commands.
+      await _writeDalyCommand(buildDalyRequest(kDalyCmdSoc, useBle: ble));
     } else {
       await _writeFrame(cellInfoRequest());
     }
@@ -546,7 +559,18 @@ class JkBmsManager {
   /// - **JK02**: Sends command 0x97
   Future<void> requestDeviceInfo() async {
     if (_detectedProtocol == BmsProtocolType.daly) {
-      await _writeDalyCommand(buildDalyRequest(kDalyCmdStatusInfo, useBle: _dalyUseBleAddress));
+      final ble = _dalyUseBleAddress;
+      // Standard status info (cell count, NTC count)
+      await _writeDalyCommand(buildDalyRequest(kDalyCmdStatusInfo, useBle: ble));
+      await Future.delayed(const Duration(milliseconds: 200));
+      // Extended: Rated parameters (nominal voltage, capacity)
+      await _writeDalyCommand(buildDalyRequest(kDalyCmdRatedParams, useBle: ble));
+      await Future.delayed(const Duration(milliseconds: 200));
+      // Extended: Battery details (production date, etc.)
+      await _writeDalyCommand(buildDalyRequest(kDalyCmdBatteryDetails, useBle: ble));
+      await Future.delayed(const Duration(milliseconds: 200));
+      // Extended: Battery code / serial number (ASCII)
+      await _writeDalyCommand(buildDalyRequest(kDalyCmdBatteryCode, useBle: ble));
     } else {
       await _writeFrame(deviceInfoRequest());
     }
@@ -678,6 +702,13 @@ class JkBmsManager {
   // ---------------------------------------------------------------------------
 
   /// Handle a fully assembled Daly frame.
+  ///
+  /// Daly data accumulates across multiple command responses (0x90–0x98).
+  /// We emit a [BmsCellStatusEvent] after every status-related command
+  /// so the UI always reflects the latest accumulated data.
+  /// The command order in [requestCellStatus] ensures that MOS status
+  /// (0x93) is received before SOC (0x90), so the final emission
+  /// contains MOSFET states, cycle count, and capacity.
   void _onDalyFrame(DalyFrame frame) {
     final cmdHex = '0x${frame.command.toRadixString(16).padLeft(2, '0')}';
 
@@ -691,28 +722,31 @@ class JkBmsManager {
 
     _log(
       'RX',
-      'Daly frame: cmd=$cmdHex, CRC=OK',
+      'Daly cmd=$cmdHex data=[${frame.data.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}]',
     );
 
     // Parse into accumulated data
     parseDalyFrame(frame, _dalyData);
 
-    // Emit cell status after each SOC response (primary update)
-    if (frame.command == kDalyCmdSoc) {
-      _eventController.add(BmsCellStatusEvent(
-        data: _dalyData.toCellStatus(),
-      ));
-    }
-
-    // Emit device info after status info response
-    if (frame.command == kDalyCmdStatusInfo) {
+    // Emit device info after status/info responses
+    if (frame.command == kDalyCmdStatusInfo ||
+        frame.command == kDalyCmdRatedParams ||
+        frame.command == kDalyCmdBatteryDetails ||
+        frame.command == kDalyCmdBatteryCode) {
       _eventController.add(BmsDeviceInfoEvent(
         data: _dalyData.toDeviceInfo(),
       ));
     }
 
-    // Also emit updated cell status after cell voltages
-    if (frame.command == kDalyCmdCellVoltages) {
+    // Emit cell status after any status-related command.
+    // Since DalyBmsData accumulates, each emission includes all
+    // previously parsed data. The SOC command (0x90) is sent last
+    // in the request sequence, so its emission is the most complete.
+    if (frame.command == kDalyCmdSoc ||
+        frame.command == kDalyCmdMosStatus ||
+        frame.command == kDalyCmdCellVoltages ||
+        frame.command == kDalyCmdMinMaxTemp ||
+        frame.command == kDalyCmdMinMaxVoltage) {
       _eventController.add(BmsCellStatusEvent(
         data: _dalyData.toCellStatus(),
       ));

@@ -76,6 +76,19 @@ const int kDalyCmdBalancing = 0x97;
 const int kDalyCmdFailure = 0x98;
 
 // ---------------------------------------------------------------------------
+// Extended Commands (Device Info / Configuration)
+// ---------------------------------------------------------------------------
+
+/// Rated parameters (nominal voltage, capacity, etc.).
+const int kDalyCmdRatedParams = 0x50;
+
+/// Battery details (production date, etc.).
+const int kDalyCmdBatteryDetails = 0x53;
+
+/// Battery code / serial number (ASCII string, multi-frame).
+const int kDalyCmdBatteryCode = 0x57;
+
+// ---------------------------------------------------------------------------
 // Scaling
 // ---------------------------------------------------------------------------
 
