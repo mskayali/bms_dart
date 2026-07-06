@@ -82,6 +82,15 @@ class DalyBmsData {
   /// Battery code / model string (from 0x57 multi-frame ASCII).
   String batteryCode = '';
 
+  /// Software Version (from 0x62 multi-frame ASCII).
+  String softwareVersion = '';
+
+  /// Hardware Version (from 0x63 multi-frame ASCII).
+  String hardwareVersionString = '';
+
+  /// Unknown 0x54 (multi-frame ASCII).
+  String unknown54 = '';
+
   /// Production / manufacturing date string (from 0x53).
   String productionDate = '';
 
@@ -94,6 +103,10 @@ class DalyBmsData {
   /// Accumulated 0x57 battery code frame fragments.
   /// Key=frame number, Value=ASCII bytes.
   final Map<int, String> _batteryCodeFrames = {};
+
+  final Map<int, String> _softwareVersionFrames = {};
+  final Map<int, String> _hardwareVersionFrames = {};
+  final Map<int, String> _unknown54Frames = {};
 
   /// Convert accumulated data to a [JkCellStatus] model.
   JkCellStatus toCellStatus() {
@@ -126,7 +139,6 @@ class DalyBmsData {
       cycleCount: cycleCount,
       totalCycleCapacity: 0,
       soh: 100,
-      totalRuntime: 0,
       chargingEnabled: chargingEnabled,
       dischargingEnabled: dischargingEnabled,
       prechargeEnabled: false,
@@ -137,12 +149,18 @@ class DalyBmsData {
 
   /// Create a [JkDeviceInfo] from accumulated Daly data.
   JkDeviceInfo toDeviceInfo() {
+    // Determine the best mapping based on what was received.
+    // Sometimes 0x57 is hardware version, sometimes 0x63. 
+    final hw = hardwareVersionString.isNotEmpty ? hardwareVersionString : batteryCode;
+    final sn = unknown54.isNotEmpty ? unknown54 : batteryCode;
+    final sw = softwareVersion.isNotEmpty ? softwareVersion : '-';
+
     return JkDeviceInfo(
       rawData: const [],
       deviceName: 'Daly BMS ${cellCount > 0 ? '${cellCount}S' : ''}',
-      hardwareVersion: batteryCode.isNotEmpty ? batteryCode : '-',
-      softwareVersion: '-',
-      serialNumber: '-',
+      hardwareVersion: hw.isNotEmpty ? hw : '-',
+      softwareVersion: sw,
+      serialNumber: sn.isNotEmpty && sn != hw ? sn : '-',
       manufacturingDate: productionDate.isNotEmpty ? productionDate : '-',
     );
   }
@@ -350,6 +368,66 @@ void parseDalyBatteryCode(DalyFrame frame, DalyBmsData data) {
   data.batteryCode = full.toString();
 }
 
+/// Parse a Daly 0x62 (Software Version) response.
+void parseDalySoftwareVersion(DalyFrame frame, DalyBmsData data) {
+  final d = frame.data;
+  final frameNum = d[0];
+
+  final buf = StringBuffer();
+  for (int i = 1; i < 8; i++) {
+    if (d[i] == 0) break;
+    buf.writeCharCode(d[i]);
+  }
+
+  data._softwareVersionFrames[frameNum] = buf.toString();
+  final sorted = data._softwareVersionFrames.keys.toList()..sort();
+  final full = StringBuffer();
+  for (final key in sorted) {
+    full.write(data._softwareVersionFrames[key]);
+  }
+  data.softwareVersion = full.toString();
+}
+
+/// Parse a Daly 0x63 (Hardware Version) response.
+void parseDalyHardwareVersion(DalyFrame frame, DalyBmsData data) {
+  final d = frame.data;
+  final frameNum = d[0];
+
+  final buf = StringBuffer();
+  for (int i = 1; i < 8; i++) {
+    if (d[i] == 0) break;
+    buf.writeCharCode(d[i]);
+  }
+
+  data._hardwareVersionFrames[frameNum] = buf.toString();
+  final sorted = data._hardwareVersionFrames.keys.toList()..sort();
+  final full = StringBuffer();
+  for (final key in sorted) {
+    full.write(data._hardwareVersionFrames[key]);
+  }
+  data.hardwareVersionString = full.toString();
+}
+
+/// Parse a Daly 0x54 (Unknown / Serial Number) response.
+void parseDalyUnknown54(DalyFrame frame, DalyBmsData data) {
+  final d = frame.data;
+  final frameNum = d[0];
+
+  final buf = StringBuffer();
+  for (int i = 1; i < 8; i++) {
+    if (d[i] == 0) break;
+    buf.writeCharCode(d[i]);
+  }
+
+  data._unknown54Frames[frameNum] = buf.toString();
+  final sorted = data._unknown54Frames.keys.toList()..sort();
+  final full = StringBuffer();
+  for (final key in sorted) {
+    full.write(data._unknown54Frames[key]);
+  }
+  data.unknown54 = full.toString();
+}
+
 /// Dispatch a Daly frame to the appropriate parser.
 void parseDalyFrame(DalyFrame frame, DalyBmsData data) {
   final d = frame.data;
@@ -399,6 +477,15 @@ void parseDalyFrame(DalyFrame frame, DalyBmsData data) {
     case kDalyCmdBatteryCode:
       parseDalyBatteryCode(frame, data);
       debugPrint('[DALY] $cmdHex RAW=[$hex] → code="${data.batteryCode}"');
+    case kDalyCmdSoftwareVersion:
+      parseDalySoftwareVersion(frame, data);
+      debugPrint('[DALY] $cmdHex RAW=[$hex] → sw="${data.softwareVersion}"');
+    case kDalyCmdHardwareVersion:
+      parseDalyHardwareVersion(frame, data);
+      debugPrint('[DALY] $cmdHex RAW=[$hex] → hw="${data.hardwareVersionString}"');
+    case kDalyCmdUnknown54:
+      parseDalyUnknown54(frame, data);
+      debugPrint('[DALY] $cmdHex RAW=[$hex] → u54="${data.unknown54}"');
     default:
       debugPrint('[DALY] $cmdHex RAW=[$hex] (unhandled)');
   }

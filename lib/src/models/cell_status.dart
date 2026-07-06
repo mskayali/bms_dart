@@ -26,7 +26,7 @@ class JkCellStatus {
     required this.cycleCount,
     required this.totalCycleCapacity,
     required this.soh,
-    required this.totalRuntime,
+    this.totalRuntime,
     required this.chargingEnabled,
     required this.dischargingEnabled,
     required this.prechargeEnabled,
@@ -100,8 +100,8 @@ class JkCellStatus {
   /// State of health in percent.
   final int soh;
 
-  /// Total runtime in seconds.
-  final int totalRuntime;
+  /// Total runtime in seconds (null if unsupported by BMS).
+  final int? totalRuntime;
 
   /// Whether the charging MOSFET is enabled.
   final bool chargingEnabled;
@@ -118,11 +118,13 @@ class JkCellStatus {
   /// Whether heating is enabled.
   final bool heatingEnabled;
 
-  /// Total runtime formatted as "Xd Xh Xm".
+  /// Total runtime formatted as "Xd Xh Xm", or "-" if unsupported.
   String get totalRuntimeFormatted {
-    final days = totalRuntime ~/ 86400;
-    final hours = (totalRuntime % 86400) ~/ 3600;
-    final minutes = (totalRuntime % 3600) ~/ 60;
+    if (totalRuntime == null) return '-';
+    
+    final days = totalRuntime! ~/ 86400;
+    final hours = (totalRuntime! % 86400) ~/ 3600;
+    final minutes = (totalRuntime! % 3600) ~/ 60;
     return '${days}d ${hours}h ${minutes}m';
   }
 

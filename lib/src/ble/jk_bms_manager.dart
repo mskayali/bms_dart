@@ -571,6 +571,15 @@ class JkBmsManager {
       await Future.delayed(const Duration(milliseconds: 200));
       // Extended: Battery code / serial number (ASCII)
       await _writeDalyCommand(buildDalyRequest(kDalyCmdBatteryCode, useBle: ble));
+      await Future.delayed(const Duration(milliseconds: 200));
+      // Extended: Software Version (ASCII)
+      await _writeDalyCommand(buildDalyRequest(kDalyCmdSoftwareVersion, useBle: ble));
+      await Future.delayed(const Duration(milliseconds: 200));
+      // Extended: Hardware Version (ASCII)
+      await _writeDalyCommand(buildDalyRequest(kDalyCmdHardwareVersion, useBle: ble));
+      await Future.delayed(const Duration(milliseconds: 200));
+      // Extended: Unknown 0x54
+      await _writeDalyCommand(buildDalyRequest(kDalyCmdUnknown54, useBle: ble));
     } else {
       await _writeFrame(deviceInfoRequest());
     }
@@ -732,7 +741,10 @@ class JkBmsManager {
     if (frame.command == kDalyCmdStatusInfo ||
         frame.command == kDalyCmdRatedParams ||
         frame.command == kDalyCmdBatteryDetails ||
-        frame.command == kDalyCmdBatteryCode) {
+        frame.command == kDalyCmdBatteryCode ||
+        frame.command == kDalyCmdSoftwareVersion ||
+        frame.command == kDalyCmdHardwareVersion ||
+        frame.command == kDalyCmdUnknown54) {
       _eventController.add(BmsDeviceInfoEvent(
         data: _dalyData.toDeviceInfo(),
       ));

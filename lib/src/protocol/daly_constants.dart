@@ -88,6 +88,15 @@ const int kDalyCmdBatteryDetails = 0x53;
 /// Battery code / serial number (ASCII string, multi-frame).
 const int kDalyCmdBatteryCode = 0x57;
 
+/// Software Version (multi-frame ASCII).
+const int kDalyCmdSoftwareVersion = 0x62;
+
+/// Hardware Version (multi-frame ASCII).
+const int kDalyCmdHardwareVersion = 0x63;
+
+/// Unknown device info (sometimes firmware/serial).
+const int kDalyCmdUnknown54 = 0x54;
+
 // ---------------------------------------------------------------------------
 // Scaling
 // ---------------------------------------------------------------------------
